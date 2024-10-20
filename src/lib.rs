@@ -74,8 +74,6 @@ impl AudioProcessor {
             let gen = IdGenerator::new(ShortEpochMaxNodes, DEFAULT_EPOCH);
             let id = gen.next_id(received_id as u16);
 
-            let id2 = gen.next_id(5);
-
             let header = FrameHeader::new(
                 EncodingFlag::PCMSigned,
                 samples_per_channel as u16,
