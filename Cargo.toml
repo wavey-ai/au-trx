@@ -1,0 +1,12 @@
+[package]
+name = "au-trx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gen-id = "0.2.1"
+rtrb = "0.3.1"
+soundkit = "0.11.8"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
