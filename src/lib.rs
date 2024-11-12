@@ -10,6 +10,18 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
+use std::fs::OpenOptions;
+use std::io::Result;
+
+fn save_as_pcm(data: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .append(true) // Open the file in append mode
+        .create(true) // Create the file if it doesn’t exist
+        .open("test.pcm")?;
+    file.write_all(data)?;
+    Ok(())
+}
+
 pub struct AudioProcessor {
     producer: Option<Producer<f32>>,
     consumer: Option<Consumer<f32>>,
@@ -75,11 +87,11 @@ impl AudioProcessor {
             let id = gen.next_id(received_id as u16);
 
             let header = FrameHeader::new(
-                EncodingFlag::PCMSigned,
+                EncodingFlag::PCMFloat,
                 samples_per_channel as u16,
                 48000,
                 2,
-                24,
+                32,
                 Endianness::LittleEndian,
                 Some(id),
             );
@@ -90,12 +102,16 @@ impl AudioProcessor {
 
             let buf_capacity = pcm_capacity + header_data.len();
             let mut send_buffer = Vec::with_capacity(buf_capacity);
+
+            let mut data_buffer = Vec::with_capacity(pcm_capacity);
+
             loop {
                 send_buffer.extend_from_slice(&header_data);
                 while send_buffer.len() < buf_capacity {
                     if let Ok(sample) = consumer.pop() {
                         let bytes = sample.to_le_bytes();
                         send_buffer.extend_from_slice(&bytes);
+                        data_buffer.extend_from_slice(&bytes);
                     } else {
                         thread::sleep(Duration::from_millis(1));
                     }
@@ -105,6 +121,13 @@ impl AudioProcessor {
                     break;
                 }
                 send_buffer.clear();
+                data_buffer.clear();
+
+                if let Err(e) = save_as_pcm(&data_buffer) {
+                    eprintln!("Failed to save PCM file: {}", e);
+                } else {
+                    println!("PCM file saved successfully as test.pcm");
+                }
             }
         });
     }
