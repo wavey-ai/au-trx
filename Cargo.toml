@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ctrlc = "3.4.5"
 gen-id = "0.2.1"
 rtrb = "0.3.1"
 soundkit = "0.11.8"
+tracing = "0.1.41"
 
 [lib]
 crate-type = ["staticlib", "cdylib"]
