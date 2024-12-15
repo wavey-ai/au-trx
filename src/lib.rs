@@ -167,7 +167,7 @@ impl AudioProcessor {
                 let (lock, cvar) = &**config_ready;
                 let mut config = lock.lock().unwrap();
                 if config.0.is_none() {
-                    config.0 = Some((data.len() / 3 / 2)); // 24-bit
+                    config.0 = Some((data.len() / 3 / chans)); // 24-bit
                     config.1 = Some(chans);
                     cvar.notify_one();
                 }

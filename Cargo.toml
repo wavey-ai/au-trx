@@ -10,5 +10,5 @@ rtrb = "0.3.1"
 soundkit = { git = "ssh://git@github.com/wavey-ai/soundkit.git" }
 tracing = "0.1.41"
 
-#[lib]
-#crate-type = ["staticlib", "cdylib"]
+[lib]
+crate-type = ["staticlib", "cdylib"]
