@@ -1,206 +1,199 @@
+use frame_header::{EncodingFlag, Endianness, FrameHeader};
 use gen_id::{ConfigPreset::ShortEpochMaxNodes, IdGenerator, DEFAULT_EPOCH};
 use rtrb::{Consumer, Producer, RingBuffer};
-use soundkit::{
-    audio_packet::FrameHeader,
-    audio_types::{EncodingFlag, Endianness},
-};
 use std::ffi::c_void;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tracing::error;
 
 const BITS_PER_SAMPLE: u8 = 24;
+const RECONNECT_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct AudioProcessor {
-    producer: Option<Producer<Vec<u8>>>,
-    consumer: Option<Consumer<Vec<u8>>>,
-    data_available: Arc<(Mutex<bool>, Condvar)>,
-    config_ready: Option<Arc<(Mutex<(Option<usize>, Option<usize>)>, Condvar)>>,
+    tcp_port: u16,
+    producer: Producer<u8>,
+    consumer: Option<Consumer<u8>>,
+    frame_size: Option<usize>, // Size of one complete audio frame in bytes
+    samples_per_channel: Option<usize>,
+    num_channels: Option<usize>,
     shutdown: Arc<AtomicBool>,
+    started: Arc<AtomicBool>,
+    data_ready: Arc<(Mutex<bool>, Condvar)>,
     tx_thread: Option<JoinHandle<()>>,
 }
 
 impl AudioProcessor {
-    pub fn new(num_channels: usize) -> Self {
-        let (producer, consumer) = RingBuffer::new(1024 * 5 * 2 * 3); // 24-bit requires 3 bytes per sample
-        let data_available = Arc::new((Mutex::new(false), Condvar::new()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let mut proc = AudioProcessor {
-            producer: Some(producer),
+    pub fn new(tcp_port: u16, ring_buffer_bytes: usize) -> Self {
+        let (producer, consumer) = RingBuffer::<u8>::new(ring_buffer_bytes);
+        Self {
+            tcp_port,
+            producer,
             consumer: Some(consumer),
-            data_available,
-            config_ready: None,
-            shutdown,
+            frame_size: None,
+            samples_per_channel: None,
+            num_channels: None,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            started: Arc::new(AtomicBool::new(false)),
+            data_ready: Arc::new((Mutex::new(false), Condvar::new())),
             tx_thread: None,
-        };
-
-        proc.start_tx(num_channels);
-        proc
+        }
     }
 
-    fn start_tx(&mut self, _num_channels: usize) {
-        let mut consumer = self.consumer.take().unwrap();
-        let data_available = Arc::clone(&self.data_available);
-        let shutdown = Arc::clone(&self.shutdown);
+    fn handle_connection(
+        mut stream: TcpStream,
+        samples_per_channel: usize,
+        num_channels: usize,
+        shutdown: Arc<AtomicBool>,
+        consumer: &mut Consumer<u8>,
+        data_ready: Arc<(Mutex<bool>, Condvar)>,
+        gen: &IdGenerator,
+    ) -> Result<(), std::io::Error> {
+        stream.write_all(b"HELO")?;
 
-        let config_ready = Arc::new((Mutex::new((None::<usize>, None::<usize>)), Condvar::new()));
-        let config_ready_clone = Arc::clone(&config_ready);
-        self.config_ready = Some(config_ready);
+        let mut id_buf = [0u8; 2];
+        stream.read_exact(&mut id_buf)?;
+        let frame_id = gen.next_id(u16::from_le_bytes(id_buf));
 
-        let handle = thread::spawn(move || {
-            let tcp_address = "127.0.0.1:4242";
-            let gen = IdGenerator::new(ShortEpochMaxNodes, DEFAULT_EPOCH);
+        let header = FrameHeader::new(
+            EncodingFlag::PCMSigned,
+            samples_per_channel as u16,
+            48_000,
+            num_channels as u8,
+            BITS_PER_SAMPLE,
+            Endianness::LittleEndian,
+            Some(frame_id),
+        )
+        .unwrap();
 
-            let (lock, cvar) = &*config_ready_clone;
-            let mut config = lock.lock().unwrap();
-            while config.0.is_none() || config.1.is_none() {
-                if shutdown.load(Ordering::SeqCst) {
-                    return;
-                }
-                let result = cvar
-                    .wait_timeout(config, Duration::from_millis(50))
-                    .unwrap();
-                config = result.0;
+        let mut header_data = Vec::with_capacity(header.size());
+        header.encode(&mut header_data).ok();
+
+        let frame_size = samples_per_channel * num_channels * 3; // 3 bytes per sample
+        let total_size = frame_size + header_data.len() + 4;
+        let mut send_buffer = Vec::with_capacity(total_size);
+
+        loop {
+            if shutdown.load(Ordering::SeqCst) {
+                return Ok(());
             }
 
-            let (samples_per_channel, num_channels) = (config.0.unwrap(), config.1.unwrap());
-            let pcm_capacity = samples_per_channel * num_channels * 3; // 24-bit requires 3 bytes per sample
-            drop(config);
+            // Wait for data or shutdown
+            {
+                let (lock, cvar) = &*data_ready;
+                let mut ready = lock.lock().unwrap();
+                while !*ready && !shutdown.load(Ordering::SeqCst) {
+                    let _ = cvar.wait_timeout(ready, RECONNECT_INTERVAL).unwrap();
+                    ready = lock.lock().unwrap();
+                }
+                *ready = false;
+            }
 
-            while !shutdown.load(Ordering::SeqCst) {
-                let mut stream = match TcpStream::connect(tcp_address) {
-                    Ok(stream) => stream,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(50));
-                        continue;
-                    }
-                };
+            if shutdown.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+
+            send_buffer.clear();
+            send_buffer.extend_from_slice(&(total_size as u32).to_le_bytes());
+            send_buffer.extend_from_slice(&header_data);
+
+            // Read exactly one frame's worth of data
+            if let Ok(chunk) = consumer.read_chunk(frame_size) {
+                let (first, second) = chunk.as_slices();
+                send_buffer.extend_from_slice(first);
+                send_buffer.extend_from_slice(second);
+                chunk.commit_all();
 
                 if shutdown.load(Ordering::SeqCst) {
-                    break;
+                    return Ok(());
                 }
-
-                stream.write_all(b"HELO").ok();
-
-                let mut id_buffer = [0u8; 2];
-                if stream.read_exact(&mut id_buffer).is_err() {
-                    continue;
-                }
-
-                let received_id = u16::from_le_bytes(id_buffer);
-                let id = gen.next_id(received_id);
-
-                let header = FrameHeader::new(
-                    EncodingFlag::PCMSigned,
-                    samples_per_channel as u16,
-                    48000,
-                    num_channels as u8,
-                    BITS_PER_SAMPLE,
-                    Endianness::LittleEndian,
-                    Some(id),
-                )
-                .expect("header encoding failed");
-
-                let mut header_data = Vec::with_capacity(header.size());
-                header.encode(&mut header_data).ok();
-
-                let buf_capacity = pcm_capacity + header_data.len() + 4;
-
-                let mut send_buffer = Vec::with_capacity(buf_capacity);
-
-                let mut d = false;
-                loop {
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    send_buffer.clear();
-                    send_buffer.extend((buf_capacity as u32).to_le_bytes());
-                    send_buffer.extend_from_slice(&header_data);
-
-                    if let Err(e) = FrameHeader::validate_header(&header_data) {
-                        error!("Invalid header: {}", e);
-                    }
-
-                    let (lock, cvar) = &*data_available;
-                    let mut available = lock.lock().unwrap();
-                    while !*available {
-                        if shutdown.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let result = cvar
-                            .wait_timeout(available, Duration::from_millis(50))
-                            .unwrap();
-                        available = result.0;
-                    }
-                    *available = false;
-
-                    while let Ok(data) = consumer.pop() {
-                        send_buffer.extend_from_slice(&data);
-                        if send_buffer.len() >= buf_capacity {
-                            break;
-                        }
-                    }
-
-                    if shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    stream.write_all(&send_buffer).ok();
-                }
-
-                stream.shutdown(Shutdown::Both).ok();
+                stream.write_all(&send_buffer)?;
             }
-        });
-
-        self.tx_thread = Some(handle);
+        }
     }
 
-    pub fn add(&mut self, data: &[u8], chans: usize) {
-        if let Some(producer) = self.producer.as_mut() {
-            if let Some(config_ready) = &self.config_ready {
-                let (lock, cvar) = &**config_ready;
-                let mut config = lock.lock().unwrap();
-                if config.0.is_none() {
-                    config.0 = Some((data.len() / 3 / chans)); // 24-bit
-                    config.1 = Some(chans);
-                    cvar.notify_one();
-                }
+    pub fn add(&mut self, data: &[u8]) {
+        if !self.started.load(Ordering::SeqCst) {
+            let frames = data.len() / 3; // 3 bytes per sample
+            let nc = self.num_channels.unwrap_or(1);
+            self.num_channels = Some(nc);
+            let spc = frames / nc;
+            self.samples_per_channel = Some(spc);
+            self.frame_size = Some(frames * 3);
+            self.start_tx(spc, nc);
+        }
+
+        // Write entire chunk at once using the safe write_chunk API
+        if let Ok(mut chunk) = self.producer.write_chunk(data.len()) {
+            let (first, second) = chunk.as_mut_slices();
+            let first_len = first.len();
+            first.copy_from_slice(&data[..first_len]);
+            if !second.is_empty() {
+                second.copy_from_slice(&data[first_len..]);
             }
+            chunk.commit_all();
 
-            // Create a single Vec<u8> from the input data
-            let data_vec = Vec::from(data);
-
-            match producer.write_chunk_uninit(1) {
-                // Write 1 chunk since we're writing one vector
-                Ok(chunk) => {
-                    chunk.fill_from_iter(std::iter::once(data_vec)); // Pass the whole vector as one item
-                }
-                Err(err) => {
-                    error!("Error adding to rtrb: {}", err);
-                }
-            }
-
-            let (lock, cvar) = &*self.data_available;
-            let mut available = lock.lock().unwrap();
-            *available = true;
+            // Notify the Tx thread
+            let (lock, cvar) = &*self.data_ready;
+            let mut ready = lock.lock().unwrap();
+            *ready = true;
             cvar.notify_one();
         }
     }
 
+    fn establish_connection(addr: SocketAddr) -> Option<TcpStream> {
+        match TcpStream::connect(addr) {
+            Ok(stream) => Some(stream),
+            Err(_) => None,
+        }
+    }
+
+    fn start_tx(&mut self, samples_per_channel: usize, num_channels: usize) {
+        let shutdown_flag = Arc::clone(&self.shutdown);
+        let data_ready = Arc::clone(&self.data_ready);
+        let addr: SocketAddr = format!("127.0.0.1:{}", self.tcp_port).parse().unwrap();
+
+        let mut consumer = self
+            .consumer
+            .take()
+            .expect("Consumer was already taken or never existed");
+
+        let handle = thread::spawn(move || {
+            let gen = IdGenerator::new(ShortEpochMaxNodes, DEFAULT_EPOCH);
+            while !shutdown_flag.load(Ordering::SeqCst) {
+                match Self::establish_connection(addr) {
+                    Some(stream) => {
+                        if let Err(_) = Self::handle_connection(
+                            stream,
+                            samples_per_channel,
+                            num_channels,
+                            Arc::clone(&shutdown_flag),
+                            &mut consumer,
+                            Arc::clone(&data_ready),
+                            &gen,
+                        ) {
+                            // On error, sleep briefly and reconnect
+                            thread::sleep(RECONNECT_INTERVAL);
+                        }
+                    }
+                    None => {
+                        // If connect failed, sleep and retry
+                        thread::sleep(RECONNECT_INTERVAL);
+                    }
+                }
+            }
+        });
+
+        self.tx_thread = Some(handle);
+        self.started.store(true, Ordering::SeqCst);
+    }
+
     pub fn shutdown(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        if let Some(config_ready) = &self.config_ready {
-            let (_, cvar) = &**config_ready;
-            cvar.notify_all();
-        }
-
-        let (_, cvar) = &*self.data_available;
+        // Notify in case Tx thread is waiting
+        let (_, cvar) = &*self.data_ready;
         cvar.notify_all();
         self.tx_thread.take();
     }
@@ -215,35 +208,25 @@ impl Drop for AudioProcessor {
 }
 
 #[no_mangle]
-pub extern "C" fn audio_processor_new(chans: usize) -> *mut c_void {
-    let processor = AudioProcessor::new(chans);
+pub extern "C" fn audio_processor_new(tcp_port: u16, ring_bytes: usize) -> *mut c_void {
+    let processor = AudioProcessor::new(tcp_port, ring_bytes);
     Box::into_raw(Box::new(processor)) as *mut c_void
 }
 
 #[no_mangle]
-pub extern "C" fn audio_processor_add(
-    instance: *mut c_void,
-    data_ptr: *const u8,
-    num_frames: usize,
-    num_chans: usize,
-) {
-    let processor: &mut AudioProcessor = unsafe {
-        assert!(!instance.is_null());
-        &mut *(instance as *mut AudioProcessor)
-    };
-    let data: &[u8] = unsafe {
-        assert!(!data_ptr.is_null());
-        std::slice::from_raw_parts(data_ptr, num_frames * num_chans * 3) // 3 bytes per 24-bit sample
-    };
-
-    processor.add(data, num_chans);
+pub extern "C" fn audio_processor_add(instance: *mut c_void, data_ptr: *const u8, length: usize) {
+    unsafe {
+        let processor = &mut *(instance as *mut AudioProcessor);
+        let data = std::slice::from_raw_parts(data_ptr, length);
+        processor.add(data);
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn audio_processor_shutdown(instance: *mut c_void) {
     unsafe {
-        assert!(!instance.is_null());
-        (&mut *(instance as *mut AudioProcessor)).shutdown();
+        let processor = &mut *(instance as *mut AudioProcessor);
+        processor.shutdown();
     }
 }
 
@@ -251,7 +234,6 @@ pub extern "C" fn audio_processor_shutdown(instance: *mut c_void) {
 pub extern "C" fn audio_processor_destroy(instance: *mut c_void) {
     if !instance.is_null() {
         unsafe {
-            println!("audio_processor_destroy called");
             drop(Box::from_raw(instance as *mut AudioProcessor));
         }
     }
