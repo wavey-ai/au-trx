@@ -50,7 +50,7 @@ dependencies = [
 [[package]]
 name = "frame-header"
 version = "0.1.0"
-source = "git+ssh://git@github.com/wavey-ai/frame-header.git#0a1979dc6c526081505960b1801eab8c25a71480"
+source = "git+ssh://git@github.com/wavey-ai/frame-header.git#2b24a78e3f2e0c8ce4a21435ee962c5e251b902b"
 dependencies = [
  "serde",
 ]
@@ -190,9 +190,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "2.0.93"
+version = "2.0.94"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c786062daee0d6db1132800e623df74274a0a87322d8e183338e01b3d98d058"
+checksum = "987bc0be1cdea8b10216bd06e2ca407d40b9543468fafd3ddfb02f36e77f71f3"
 dependencies = [
  "proc-macro2",
  "quote",

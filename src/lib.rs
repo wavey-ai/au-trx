@@ -65,6 +65,7 @@ impl AudioProcessor {
             BITS_PER_SAMPLE,
             Endianness::LittleEndian,
             Some(frame_id),
+            Some(123),
         )
         .unwrap();
 
@@ -74,6 +75,8 @@ impl AudioProcessor {
         let frame_size = samples_per_channel * num_channels * 3; // 3 bytes per sample
         let total_size = frame_size + header_data.len() + 4;
         let mut send_buffer = Vec::with_capacity(total_size);
+
+        let mut pts_array = [0u8; 8];
 
         loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -97,6 +100,17 @@ impl AudioProcessor {
 
             send_buffer.clear();
             send_buffer.extend_from_slice(&(total_size as u32).to_le_bytes());
+
+            if let Ok(chunk) = consumer.read_chunk(8) {
+                let (first, second) = chunk.as_slices();
+                pts_array[..first.len()].copy_from_slice(first);
+                pts_array[first.len()..first.len() + second.len()].copy_from_slice(second);
+                chunk.commit_all();
+            }
+
+            let pts_val = u64::from_le_bytes(pts_array);
+            println!("{}", pts_val);
+            FrameHeader::patch_pts(&mut header_data, Some(pts_val)).unwrap();
             send_buffer.extend_from_slice(&header_data);
 
             // Read exactly one frame's worth of data
@@ -116,15 +130,25 @@ impl AudioProcessor {
 
     pub fn add(&mut self, data: &[u8]) {
         if !self.started.load(Ordering::SeqCst) {
-            let frames = data.len() / 3; // 3 bytes per sample
-            let nc = self.num_channels.unwrap_or(1);
+            // Remove PTS bytes first
+            let audio_data_len = data.len() - 8;
+            // Each sample is 3 bytes (24-bit)
+            let bytes_per_sample = 3;
+            // Calculate number of channels (total bytes / bytes per stereo frame)
+            let nc = if audio_data_len % (2 * bytes_per_sample) == 0 {
+                2
+            } else {
+                1
+            };
             self.num_channels = Some(nc);
-            let spc = frames / nc;
+
+            // Calculate samples per channel (total samples / number of channels)
+            let total_samples = audio_data_len / bytes_per_sample;
+            let spc = total_samples / nc;
             self.samples_per_channel = Some(spc);
-            self.frame_size = Some(frames * 3);
+            self.frame_size = Some(audio_data_len);
             self.start_tx(spc, nc);
         }
-
         // Write entire chunk at once using the safe write_chunk API
         if let Ok(mut chunk) = self.producer.write_chunk(data.len()) {
             let (first, second) = chunk.as_mut_slices();
@@ -236,5 +260,204 @@ pub extern "C" fn audio_processor_destroy(instance: *mut c_void) {
         unsafe {
             drop(Box::from_raw(instance as *mut AudioProcessor));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct ReceivedFrame {
+        header: FrameHeader,
+        audio_data: Vec<u8>,
+    }
+
+    struct MockAudioServer {
+        listener: TcpListener,
+        received_frames: Arc<Mutex<Vec<ReceivedFrame>>>,
+    }
+
+    impl MockAudioServer {
+        fn new(port: u16) -> Self {
+            let listener =
+                TcpListener::bind(format!("127.0.0.1:{}", port)).expect("Failed to bind to port");
+            Self {
+                listener,
+                received_frames: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn start(&self) -> Arc<Mutex<Vec<ReceivedFrame>>> {
+            let listener = self.listener.try_clone().unwrap();
+            let frames = Arc::clone(&self.received_frames);
+
+            thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    println!("Server: Accepted connection");
+
+                    // Expect HELO
+                    let mut hello_buf = [0u8; 4];
+                    if let Ok(_) = stream.read_exact(&mut hello_buf) {
+                        assert_eq!(&hello_buf, b"HELO", "Expected HELO handshake");
+                        println!("Server: Received HELO");
+
+                        // Send frame ID (u16 as little endian)
+                        stream.write_all(&1u16.to_le_bytes()).unwrap();
+                        println!("Server: Sent frame ID");
+
+                        // Read frames
+                        loop {
+                            // Read total size
+                            let mut size_buf = [0u8; 4];
+                            if stream.read_exact(&mut size_buf).is_err() {
+                                break;
+                            }
+                            let total_size = u32::from_le_bytes(size_buf) as usize;
+                            println!("Server: Frame size: {}", total_size);
+
+                            // Read frame data
+                            let mut frame_data = vec![0u8; total_size - 4];
+                            if stream.read_exact(&mut frame_data).is_err() {
+                                break;
+                            }
+
+                            println!(
+                                "Server: Raw header bytes: {:02x?}",
+                                &frame_data[..std::cmp::min(frame_data.len(), 20)]
+                            );
+
+                            // Parse header
+                            if let Ok(header) = FrameHeader::decode(&mut &frame_data[..]) {
+                                let header_size = header.size();
+                                let audio_data = frame_data[header_size..].to_vec();
+
+                                println!("Server: Decoded frame header:");
+                                println!("  Encoding: {:?}", header.encoding());
+                                println!("  Sample Size: {}", header.sample_size());
+                                println!("  Sample Rate: {}", header.sample_rate());
+                                println!("  Channels: {}", header.channels());
+                                println!("  Bits/Sample: {}", header.bits_per_sample());
+                                println!("  Endianness: {:?}", header.endianness());
+                                println!("  ID: {:?}", header.id());
+                                println!("  PTS: {:?}", header.pts());
+                                println!("  Header Size: {}", header_size);
+                                println!("  Audio Data Size: {}", audio_data.len());
+
+                                frames
+                                    .lock()
+                                    .unwrap()
+                                    .push(ReceivedFrame { header, audio_data });
+                            } else {
+                                println!("Server: Failed to decode header!");
+                            }
+                        }
+                    }
+                }
+            });
+
+            Arc::clone(&self.received_frames)
+        }
+    }
+
+    #[test]
+    fn test_audio_processor_lifecycle() {
+        const TEST_PORT: u16 = 12345;
+        const RING_BUFFER_SIZE: usize = 1024 * 1024;
+
+        // Start mock server
+        let server = MockAudioServer::new(TEST_PORT);
+        let received_frames = server.start();
+
+        thread::sleep(Duration::from_millis(100));
+
+        let processor = audio_processor_new(TEST_PORT, RING_BUFFER_SIZE);
+        assert!(!processor.is_null(), "AudioProcessor creation failed");
+
+        // Generate test data with PTS followed by stereo audio samples
+        let pts: u64 = 1234;
+        let num_samples = 10;
+        let mut test_data = vec![0u8; 8 + 3 * 2 * num_samples]; // PTS + stereo samples
+
+        println!("Client: Creating test data");
+        println!("  PTS: {}", pts);
+        println!("  Num samples: {}", num_samples);
+        println!("  Total bytes: {}", test_data.len());
+
+        // Set PTS
+        test_data[0..8].copy_from_slice(&pts.to_le_bytes());
+
+        // Fill with test pattern (24-bit stereo)
+        for i in (8..test_data.len()).step_by(6) {
+            // Left channel
+            test_data[i] = 0x12;
+            test_data[i + 1] = 0x34;
+            test_data[i + 2] = 0x56;
+            // Right channel
+            test_data[i + 3] = 0x78;
+            test_data[i + 4] = 0x9A;
+            test_data[i + 5] = 0xBC;
+        }
+
+        println!(
+            "Client: First few bytes of test data: {:02x?}",
+            &test_data[..std::cmp::min(test_data.len(), 20)]
+        );
+
+        // Send data
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len());
+
+        thread::sleep(Duration::from_millis(500));
+
+        // Validate
+        let frames = received_frames.lock().unwrap();
+        assert!(!frames.is_empty(), "No frames received");
+
+        let first_frame = &frames[0];
+        assert_eq!(first_frame.header.pts(), Some(pts), "Incorrect PTS value");
+        assert_eq!(first_frame.header.channels(), 2, "Expected stereo");
+        assert_eq!(
+            first_frame.header.bits_per_sample(),
+            24,
+            "Expected 24-bit audio"
+        );
+        assert_eq!(
+            first_frame.header.sample_rate(),
+            48_000,
+            "Expected 48kHz sample rate"
+        );
+
+        // Verify audio data
+        assert_eq!(
+            first_frame.audio_data.len(),
+            3 * 2 * num_samples,
+            "Incorrect audio data length. Expected {}, got {}",
+            3 * 2 * num_samples,
+            first_frame.audio_data.len()
+        );
+
+        for i in (0..first_frame.audio_data.len()).step_by(6) {
+            assert_eq!(
+                &first_frame.audio_data[i..i + 3],
+                &[0x12, 0x34, 0x56],
+                "Incorrect left channel data at offset {}",
+                i
+            );
+            assert_eq!(
+                &first_frame.audio_data[i + 3..i + 6],
+                &[0x78, 0x9A, 0xBC],
+                "Incorrect right channel data at offset {}",
+                i
+            );
+        }
+
+        // Cleanup
+        audio_processor_shutdown(processor);
+        audio_processor_destroy(processor);
     }
 }
