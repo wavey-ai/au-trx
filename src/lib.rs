@@ -8,46 +8,48 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BITS_PER_SAMPLE: u8 = 24;
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(50);
 
 pub struct AudioProcessor {
     tcp_port: u16,
-    producer: Producer<u8>,
-    consumer: Option<Consumer<u8>>,
-    frame_size: Option<usize>, // Size of one complete audio frame in bytes
+    producer: Producer<(u64, Vec<u8>)>,
+    consumer: Option<Consumer<(u64, Vec<u8>)>>,
     samples_per_channel: Option<usize>,
-    num_channels: Option<usize>,
     shutdown: Arc<AtomicBool>,
     started: Arc<AtomicBool>,
     data_ready: Arc<(Mutex<bool>, Condvar)>,
     tx_thread: Option<JoinHandle<()>>,
+    num_channels: u8,
+    sample_rate: u32,
 }
 
 impl AudioProcessor {
-    pub fn new(tcp_port: u16, ring_buffer_bytes: usize) -> Self {
-        let (producer, consumer) = RingBuffer::<u8>::new(ring_buffer_bytes);
+    pub fn new(tcp_port: u16, num_channels: u8, sample_rate: u32) -> Self {
+        let (producer, consumer) = RingBuffer::<(u64, Vec<u8>)>::new(256);
         Self {
             tcp_port,
             producer,
             consumer: Some(consumer),
-            frame_size: None,
             samples_per_channel: None,
-            num_channels: None,
+            num_channels,
             shutdown: Arc::new(AtomicBool::new(false)),
             started: Arc::new(AtomicBool::new(false)),
             data_ready: Arc::new((Mutex::new(false), Condvar::new())),
             tx_thread: None,
+            sample_rate,
         }
     }
 
     fn handle_connection(
         mut stream: TcpStream,
         samples_per_channel: usize,
-        num_channels: usize,
+        num_channels: u8,
+        sample_rate: u32,
         shutdown: Arc<AtomicBool>,
-        consumer: &mut Consumer<u8>,
+        consumer: &mut Consumer<(u64, Vec<u8>)>,
         data_ready: Arc<(Mutex<bool>, Condvar)>,
         gen: &IdGenerator,
     ) -> Result<(), std::io::Error> {
@@ -60,8 +62,8 @@ impl AudioProcessor {
         let header = FrameHeader::new(
             EncodingFlag::PCMSigned,
             samples_per_channel as u16,
-            48_000,
-            num_channels as u8,
+            sample_rate,
+            num_channels,
             BITS_PER_SAMPLE,
             Endianness::LittleEndian,
             Some(frame_id),
@@ -72,11 +74,9 @@ impl AudioProcessor {
         let mut header_data = Vec::with_capacity(header.size());
         header.encode(&mut header_data).ok();
 
-        let frame_size = samples_per_channel * num_channels * 3; // 3 bytes per sample
+        let frame_size = samples_per_channel * num_channels as usize * 3; // 3 bytes per sample
         let total_size = frame_size + header_data.len() + 4;
         let mut send_buffer = Vec::with_capacity(total_size);
-
-        let mut pts_array = [0u8; 8];
 
         loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -98,73 +98,54 @@ impl AudioProcessor {
                 return Ok(());
             }
 
-            send_buffer.clear();
-            send_buffer.extend_from_slice(&(total_size as u32).to_le_bytes());
-
-            if let Ok(chunk) = consumer.read_chunk(8) {
-                let (first, second) = chunk.as_slices();
-                pts_array[..first.len()].copy_from_slice(first);
-                pts_array[first.len()..first.len() + second.len()].copy_from_slice(second);
-                chunk.commit_all();
+            'inner: for _ in 0..consumer.slots() {
+                match consumer.pop() {
+                    Ok(chunk) => {
+                        FrameHeader::patch_pts(&mut header_data, Some(chunk.0)).unwrap();
+                        send_buffer.clear();
+                        send_buffer.extend_from_slice(&(total_size as u32).to_le_bytes());
+                        send_buffer.extend_from_slice(&header_data);
+                        send_buffer.extend_from_slice(&chunk.1);
+                        stream.write_all(&send_buffer)?;
+                    }
+                    Err(e) => {
+                        break 'inner;
+                    }
+                }
             }
 
-            let pts_val = u64::from_le_bytes(pts_array);
-            println!("{}", pts_val);
-            FrameHeader::patch_pts(&mut header_data, Some(pts_val)).unwrap();
-            send_buffer.extend_from_slice(&header_data);
-
-            // Read exactly one frame's worth of data
-            if let Ok(chunk) = consumer.read_chunk(frame_size) {
-                let (first, second) = chunk.as_slices();
-                send_buffer.extend_from_slice(first);
-                send_buffer.extend_from_slice(second);
-                chunk.commit_all();
-
-                if shutdown.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                stream.write_all(&send_buffer)?;
+            if shutdown.load(Ordering::SeqCst) {
+                return Ok(());
             }
         }
     }
 
     pub fn add(&mut self, data: &[u8]) {
         if !self.started.load(Ordering::SeqCst) {
-            // Remove PTS bytes first
-            let audio_data_len = data.len() - 8;
+            let audio_data_len = data.len();
             // Each sample is 3 bytes (24-bit)
             let bytes_per_sample = 3;
-            // Calculate number of channels (total bytes / bytes per stereo frame)
-            let nc = if audio_data_len % (2 * bytes_per_sample) == 0 {
-                2
-            } else {
-                1
-            };
-            self.num_channels = Some(nc);
-
             // Calculate samples per channel (total samples / number of channels)
             let total_samples = audio_data_len / bytes_per_sample;
-            let spc = total_samples / nc;
+            let spc = total_samples / self.num_channels as usize;
             self.samples_per_channel = Some(spc);
-            self.frame_size = Some(audio_data_len);
-            self.start_tx(spc, nc);
+            self.start_tx(spc);
         }
-        // Write entire chunk at once using the safe write_chunk API
-        if let Ok(mut chunk) = self.producer.write_chunk(data.len()) {
-            let (first, second) = chunk.as_mut_slices();
-            let first_len = first.len();
-            first.copy_from_slice(&data[..first_len]);
-            if !second.is_empty() {
-                second.copy_from_slice(&data[first_len..]);
-            }
-            chunk.commit_all();
 
-            // Notify the Tx thread
-            let (lock, cvar) = &*self.data_ready;
-            let mut ready = lock.lock().unwrap();
-            *ready = true;
-            cvar.notify_one();
-        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_micros() as u64;
+
+        if let Err(e) = self.producer.push((now, data.to_vec())) {
+            return;
+        };
+
+        // Notify the Tx thread
+        let (lock, cvar) = &*self.data_ready;
+        let mut ready = lock.lock().unwrap();
+        *ready = true;
+        cvar.notify_one();
     }
 
     fn establish_connection(addr: SocketAddr) -> Option<TcpStream> {
@@ -174,7 +155,7 @@ impl AudioProcessor {
         }
     }
 
-    fn start_tx(&mut self, samples_per_channel: usize, num_channels: usize) {
+    fn start_tx(&mut self, samples_per_channel: usize) {
         let shutdown_flag = Arc::clone(&self.shutdown);
         let data_ready = Arc::clone(&self.data_ready);
         let addr: SocketAddr = format!("127.0.0.1:{}", self.tcp_port).parse().unwrap();
@@ -183,6 +164,9 @@ impl AudioProcessor {
             .consumer
             .take()
             .expect("Consumer was already taken or never existed");
+
+        let num_channels = self.num_channels;
+        let sample_rate = self.sample_rate;
 
         let handle = thread::spawn(move || {
             let gen = IdGenerator::new(ShortEpochMaxNodes, DEFAULT_EPOCH);
@@ -193,6 +177,7 @@ impl AudioProcessor {
                             stream,
                             samples_per_channel,
                             num_channels,
+                            sample_rate,
                             Arc::clone(&shutdown_flag),
                             &mut consumer,
                             Arc::clone(&data_ready),
@@ -232,8 +217,12 @@ impl Drop for AudioProcessor {
 }
 
 #[no_mangle]
-pub extern "C" fn audio_processor_new(tcp_port: u16, ring_bytes: usize) -> *mut c_void {
-    let processor = AudioProcessor::new(tcp_port, ring_bytes);
+pub extern "C" fn audio_processor_new(
+    tcp_port: u16,
+    channels: u8,
+    sample_rate: u32,
+) -> *mut c_void {
+    let processor = AudioProcessor::new(tcp_port, channels, sample_rate);
     Box::into_raw(Box::new(processor)) as *mut c_void
 }
 
@@ -368,7 +357,6 @@ mod tests {
     #[test]
     fn test_audio_processor_lifecycle() {
         const TEST_PORT: u16 = 12345;
-        const RING_BUFFER_SIZE: usize = 1024 * 1024;
 
         // Start mock server
         let server = MockAudioServer::new(TEST_PORT);
@@ -376,24 +364,18 @@ mod tests {
 
         thread::sleep(Duration::from_millis(100));
 
-        let processor = audio_processor_new(TEST_PORT, RING_BUFFER_SIZE);
+        let processor = audio_processor_new(TEST_PORT, 2, 48_000);
         assert!(!processor.is_null(), "AudioProcessor creation failed");
 
-        // Generate test data with PTS followed by stereo audio samples
-        let pts: u64 = 1234;
         let num_samples = 10;
-        let mut test_data = vec![0u8; 8 + 3 * 2 * num_samples]; // PTS + stereo samples
+        let mut test_data = vec![0u8; 3 * 2 * num_samples];
 
         println!("Client: Creating test data");
-        println!("  PTS: {}", pts);
         println!("  Num samples: {}", num_samples);
         println!("  Total bytes: {}", test_data.len());
 
-        // Set PTS
-        test_data[0..8].copy_from_slice(&pts.to_le_bytes());
-
         // Fill with test pattern (24-bit stereo)
-        for i in (8..test_data.len()).step_by(6) {
+        for i in (0..test_data.len()).step_by(6) {
             // Left channel
             test_data[i] = 0x12;
             test_data[i + 1] = 0x34;
@@ -413,13 +395,17 @@ mod tests {
         audio_processor_add(processor, test_data.as_ptr(), test_data.len());
 
         thread::sleep(Duration::from_millis(500));
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len());
+
+        thread::sleep(Duration::from_millis(500));
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len());
 
         // Validate
         let frames = received_frames.lock().unwrap();
         assert!(!frames.is_empty(), "No frames received");
 
         let first_frame = &frames[0];
-        assert_eq!(first_frame.header.pts(), Some(pts), "Incorrect PTS value");
+        //        assert_eq!(first_frame.header.pts(), Some(pts), "Incorrect PTS value");
         assert_eq!(first_frame.header.channels(), 2, "Expected stereo");
         assert_eq!(
             first_frame.header.bits_per_sample(),

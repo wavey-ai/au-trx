@@ -1,6 +1,6 @@
 [package]
 name = "au-trx"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -10,5 +10,5 @@ rtrb = "0.3.1"
 frame-header = { git = "ssh://git@github.com/wavey-ai/frame-header.git" }
 tracing = "0.1.41"
 
-[lib]
-crate-type = ["staticlib", "cdylib"]
+#[lib]
+#crate-type = ["staticlib", "cdylib"]
