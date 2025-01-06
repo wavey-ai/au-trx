@@ -120,7 +120,7 @@ impl AudioProcessor {
         }
     }
 
-    pub fn add(&mut self, data: &[u8]) {
+    pub fn add(&mut self, data: &[u8], ts: u64) {
         if !self.started.load(Ordering::SeqCst) {
             let audio_data_len = data.len();
             // Each sample is 3 bytes (24-bit)
@@ -132,12 +132,7 @@ impl AudioProcessor {
             self.start_tx(spc);
         }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_micros() as u64;
-
-        if let Err(e) = self.producer.push((now, data.to_vec())) {
+        if let Err(e) = self.producer.push((ts, data.to_vec())) {
             return;
         };
 
@@ -227,11 +222,16 @@ pub extern "C" fn audio_processor_new(
 }
 
 #[no_mangle]
-pub extern "C" fn audio_processor_add(instance: *mut c_void, data_ptr: *const u8, length: usize) {
+pub extern "C" fn audio_processor_add(
+    instance: *mut c_void,
+    data_ptr: *const u8,
+    length: usize,
+    ts: u64,
+) {
     unsafe {
         let processor = &mut *(instance as *mut AudioProcessor);
         let data = std::slice::from_raw_parts(data_ptr, length);
-        processor.add(data);
+        processor.add(data, ts);
     }
 }
 
@@ -391,14 +391,19 @@ mod tests {
             &test_data[..std::cmp::min(test_data.len(), 20)]
         );
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_micros() as u64;
+
         // Send data
-        audio_processor_add(processor, test_data.as_ptr(), test_data.len());
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), now);
 
         thread::sleep(Duration::from_millis(500));
-        audio_processor_add(processor, test_data.as_ptr(), test_data.len());
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), now);
 
         thread::sleep(Duration::from_millis(500));
-        audio_processor_add(processor, test_data.as_ptr(), test_data.len());
+        audio_processor_add(processor, test_data.as_ptr(), test_data.len(), now);
 
         // Validate
         let frames = received_frames.lock().unwrap();
