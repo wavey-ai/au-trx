@@ -24,6 +24,7 @@ pub struct AudioProcessor {
     tx_thread: Option<JoinHandle<()>>,
     num_channels: u8,
     sample_rate: u32,
+    frame_id: Option<u16>,
 }
 
 impl AudioProcessor {
@@ -40,7 +41,13 @@ impl AudioProcessor {
             data_ready: Arc::new((Mutex::new(false), Condvar::new())),
             tx_thread: None,
             sample_rate,
+            frame_id: None,
         }
+    }
+
+    pub fn with_frame_id(mut self, frame_id: u16) -> Self {
+        self.frame_id = Some(frame_id);
+        self
     }
 
     fn handle_connection(
@@ -52,12 +59,18 @@ impl AudioProcessor {
         consumer: &mut Consumer<(u64, Vec<u8>)>,
         data_ready: Arc<(Mutex<bool>, Condvar)>,
         gen: &IdGenerator,
+        frame_id: Option<u16>,
     ) -> Result<(), std::io::Error> {
         stream.write_all(b"HELO")?;
 
         let mut id_buf = [0u8; 2];
         stream.read_exact(&mut id_buf)?;
-        let frame_id = gen.next_id(u16::from_le_bytes(id_buf));
+
+        let id = gen.next_id(if let Some(frame_id) = frame_id {
+            frame_id
+        } else {
+            u16::from_le_bytes(id_buf)
+        });
 
         let header = FrameHeader::new(
             EncodingFlag::PCMSigned,
@@ -66,7 +79,7 @@ impl AudioProcessor {
             num_channels,
             BITS_PER_SAMPLE,
             Endianness::LittleEndian,
-            Some(frame_id),
+            Some(id),
             Some(123),
         )
         .unwrap();
@@ -162,6 +175,7 @@ impl AudioProcessor {
 
         let num_channels = self.num_channels;
         let sample_rate = self.sample_rate;
+        let frame_id = self.frame_id;
 
         let handle = thread::spawn(move || {
             let gen = IdGenerator::new(ShortEpochMaxNodes, DEFAULT_EPOCH);
@@ -177,6 +191,7 @@ impl AudioProcessor {
                             &mut consumer,
                             Arc::clone(&data_ready),
                             &gen,
+                            frame_id,
                         ) {
                             // On error, sleep briefly and reconnect
                             thread::sleep(RECONNECT_INTERVAL);
@@ -218,6 +233,17 @@ pub extern "C" fn audio_processor_new(
     sample_rate: u32,
 ) -> *mut c_void {
     let processor = AudioProcessor::new(tcp_port, channels, sample_rate);
+    Box::into_raw(Box::new(processor)) as *mut c_void
+}
+
+#[no_mangle]
+pub extern "C" fn audio_processor_new_with_id(
+    tcp_port: u16,
+    channels: u8,
+    sample_rate: u32,
+    frame_id: u16,
+) -> *mut c_void {
+    let processor = AudioProcessor::new(tcp_port, channels, sample_rate).with_frame_id(frame_id);
     Box::into_raw(Box::new(processor)) as *mut c_void
 }
 

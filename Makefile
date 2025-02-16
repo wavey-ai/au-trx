@@ -1,2 +1,2 @@
 build:
-	cargo build --release && mv ./target/release/libau_trx.a ../../infidelity/autx/Common/
+	cargo build --target aarch64-apple-ios --release && cp ./target/aarch64-apple-ios/release/libau_trx.a ../../infidelity/autx/Common/
