@@ -58,7 +58,6 @@ impl AudioProcessor {
         shutdown: Arc<AtomicBool>,
         consumer: &mut Consumer<(u64, Vec<u8>)>,
         data_ready: Arc<(Mutex<bool>, Condvar)>,
-        gen: &IdGenerator,
         frame_id: Option<u16>,
     ) -> Result<(), std::io::Error> {
         stream.write_all(b"HELO")?;
@@ -66,11 +65,11 @@ impl AudioProcessor {
         let mut id_buf = [0u8; 2];
         stream.read_exact(&mut id_buf)?;
 
-        let id = gen.next_id(if let Some(frame_id) = frame_id {
+        let id = if let Some(frame_id) = frame_id {
             frame_id
         } else {
             u16::from_le_bytes(id_buf)
-        });
+        } as u64;
 
         let header = FrameHeader::new(
             EncodingFlag::PCMSigned,
@@ -178,7 +177,6 @@ impl AudioProcessor {
         let frame_id = self.frame_id;
 
         let handle = thread::spawn(move || {
-            let gen = IdGenerator::new(ShortEpochMaxNodes, DEFAULT_EPOCH);
             while !shutdown_flag.load(Ordering::SeqCst) {
                 match Self::establish_connection(addr) {
                     Some(stream) => {
@@ -190,7 +188,6 @@ impl AudioProcessor {
                             Arc::clone(&shutdown_flag),
                             &mut consumer,
                             Arc::clone(&data_ready),
-                            &gen,
                             frame_id,
                         ) {
                             // On error, sleep briefly and reconnect
