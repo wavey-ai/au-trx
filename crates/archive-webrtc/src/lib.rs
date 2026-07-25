@@ -1,4 +1,4 @@
-//! Reliable, direct-only archive transport shared by the AU and iOS app.
+//! Reliable archive transport shared by the AU and iOS app.
 
 use matchbox_socket::{ChannelConfig, PeerId, PeerState, RtcIceServerConfig, WebRtcSocket};
 use std::ffi::{c_char, CStr};
@@ -14,6 +14,20 @@ const QUEUE_CAPACITY: usize = 64;
 const STATE_DISCOVERING: u32 = 1;
 const STATE_CONNECTED: u32 = 2;
 const STATE_FAILED: u32 = 3;
+const MAX_TURN_CREDENTIAL_BYTES: usize = 1_024;
+const TURN_URLS: &[&str] = &[
+    "turn:turn.cloudflare.com:3478?transport=udp",
+    "turn:turn.cloudflare.com:3478?transport=tcp",
+    "turn:turn.cloudflare.com:80?transport=tcp",
+    "turns:turn.cloudflare.com:5349?transport=tcp",
+    "turns:turn.cloudflare.com:443?transport=tcp",
+];
+const DEBUG_STUN_URL: &str = "stun:stun.cloudflare.com:3478";
+
+struct TurnCredentials {
+    username: String,
+    credential: String,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -89,13 +103,42 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 pub unsafe extern "C" fn archive_webrtc_new(
     signaling_url: *const c_char,
 ) -> *mut ArchiveWebRtcHandle {
+    archive_webrtc_new_inner(signaling_url, None)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn archive_webrtc_new_with_turn(
+    signaling_url: *const c_char,
+    turn_username: *const c_char,
+    turn_credential: *const c_char,
+) -> *mut ArchiveWebRtcHandle {
+    let Some(username) = copy_turn_value(turn_username) else {
+        return ptr::null_mut();
+    };
+    let Some(credential) = copy_turn_value(turn_credential) else {
+        return ptr::null_mut();
+    };
+    archive_webrtc_new_inner(
+        signaling_url,
+        Some(TurnCredentials {
+            username,
+            credential,
+        }),
+    )
+}
+
+unsafe fn archive_webrtc_new_inner(
+    signaling_url: *const c_char,
+    turn_credentials: Option<TurnCredentials>,
+) -> *mut ArchiveWebRtcHandle {
     if signaling_url.is_null() {
         return ptr::null_mut();
     }
     let Ok(url) = CStr::from_ptr(signaling_url).to_str() else {
         return ptr::null_mut();
     };
-    if !valid_signaling_url(url) {
+    if !valid_signaling_url(url) || (is_production_signaling_url(url) && turn_credentials.is_none())
+    {
         return ptr::null_mut();
     }
 
@@ -107,6 +150,7 @@ pub unsafe extern "C" fn archive_webrtc_new(
         Arc::clone(&state),
         outbound_rx,
         inbound_tx,
+        turn_credentials,
     ));
 
     Box::into_raw(Box::new(ArchiveWebRtcHandle {
@@ -114,6 +158,17 @@ pub unsafe extern "C" fn archive_webrtc_new(
         outbound: outbound_tx,
         inbound: Mutex::new(inbound_rx),
     }))
+}
+
+unsafe fn copy_turn_value(value: *const c_char) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    let value = CStr::from_ptr(value).to_str().ok()?;
+    if value.is_empty() || value.len() > MAX_TURN_CREDENTIAL_BYTES {
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 #[no_mangle]
@@ -203,13 +258,11 @@ async fn run_socket(
     state: Arc<SharedState>,
     outbound: Receiver<Vec<u8>>,
     inbound: SyncSender<Vec<u8>>,
+    turn_credentials: Option<TurnCredentials>,
 ) {
+    let ice_server = ice_server_config(turn_credentials);
     let (mut socket, mut loop_future) = WebRtcSocket::builder(signaling_url)
-        .ice_server(RtcIceServerConfig {
-            urls: vec!["stun:stun.cloudflare.com:3478".to_owned()],
-            username: None,
-            credential: None,
-        })
+        .ice_server(ice_server)
         .reconnect_attempts(None)
         .signaling_keep_alive_interval(Some(Duration::from_secs(10)))
         .add_channel(ChannelConfig::reliable())
@@ -221,8 +274,8 @@ async fn run_socket(
         tokio::select! {
             result = &mut loop_future => {
                 state.fail(match result {
-                    Ok(()) => "The direct archive connection ended.".to_owned(),
-                    Err(error) => format!("The direct archive connection failed: {error}"),
+                    Ok(()) => "The remote archive connection ended.".to_owned(),
+                    Err(error) => format!("The remote archive connection failed: {error}"),
                 });
                 return;
             }
@@ -253,7 +306,7 @@ async fn run_socket(
                             state.bytes_received.fetch_add(length, Ordering::Relaxed);
                         }
                         Err(_) => {
-                            state.fail("The direct archive receive queue is full.");
+                            state.fail("The remote archive receive queue is full.");
                             return;
                         }
                     }
@@ -276,8 +329,29 @@ async fn run_socket(
     }
 }
 
+fn ice_server_config(turn_credentials: Option<TurnCredentials>) -> RtcIceServerConfig {
+    match turn_credentials {
+        Some(turn) => RtcIceServerConfig {
+            urls: TURN_URLS.iter().map(|url| (*url).to_owned()).collect(),
+            username: Some(turn.username),
+            credential: Some(turn.credential),
+            relay_only: true,
+        },
+        None => RtcIceServerConfig {
+            urls: vec![DEBUG_STUN_URL.to_owned()],
+            username: None,
+            credential: None,
+            relay_only: false,
+        },
+    }
+}
+
+fn is_production_signaling_url(url: &str) -> bool {
+    url.starts_with("wss://api.infidelity.io/v1/archive-rendezvous/")
+}
+
 fn valid_signaling_url(url: &str) -> bool {
-    let production = url.starts_with("wss://api.infidelity.io/v1/archive-rendezvous/");
+    let production = is_production_signaling_url(url);
     let direct_protocol = url.contains("protocol=matchbox-v1");
     if production && direct_protocol {
         return true;
@@ -315,6 +389,39 @@ mod tests {
     }
 
     #[test]
+    fn turn_values_must_be_present_and_bounded() {
+        let value = std::ffi::CString::new("temporary").unwrap();
+        assert_eq!(
+            unsafe { copy_turn_value(value.as_ptr()) }.as_deref(),
+            Some("temporary")
+        );
+        assert!(unsafe { copy_turn_value(ptr::null()) }.is_none());
+
+        let empty = std::ffi::CString::new("").unwrap();
+        assert!(unsafe { copy_turn_value(empty.as_ptr()) }.is_none());
+
+        let oversized = std::ffi::CString::new("x".repeat(MAX_TURN_CREDENTIAL_BYTES + 1)).unwrap();
+        assert!(unsafe { copy_turn_value(oversized.as_ptr()) }.is_none());
+    }
+
+    #[test]
+    fn production_archive_requires_turn_and_restricts_ice_to_relays() {
+        let production = std::ffi::CString::new(
+            "wss://api.infidelity.io/v1/archive-rendezvous/id?protocol=matchbox-v1",
+        )
+        .unwrap();
+        assert!(unsafe { archive_webrtc_new(production.as_ptr()) }.is_null());
+
+        let config = ice_server_config(Some(TurnCredentials {
+            username: "temporary-user".to_owned(),
+            credential: "temporary-password".to_owned(),
+        }));
+        assert!(config.relay_only);
+        assert!(config.urls.iter().all(|url| url.starts_with("turn")));
+        assert!(!config.urls.iter().any(|url| url.starts_with("stun:")));
+    }
+
+    #[test]
     #[ignore = "connects to the production Cloudflare rendezvous"]
     fn production_reliable_data_channel_round_trip() {
         let pairing_id = std::env::var("ARCHIVE_WEBRTC_SMOKE_PAIRING_ID")
@@ -330,11 +437,33 @@ mod tests {
         );
         let plugin_url = std::ffi::CString::new(format!("{base}&role=plugin")).unwrap();
         let phone_url = std::ffi::CString::new(format!("{base}&role=phone")).unwrap();
+        let turn_username = std::ffi::CString::new(
+            std::env::var("ARCHIVE_WEBRTC_SMOKE_TURN_USERNAME")
+                .expect("set ARCHIVE_WEBRTC_SMOKE_TURN_USERNAME"),
+        )
+        .unwrap();
+        let turn_credential = std::ffi::CString::new(
+            std::env::var("ARCHIVE_WEBRTC_SMOKE_TURN_CREDENTIAL")
+                .expect("set ARCHIVE_WEBRTC_SMOKE_TURN_CREDENTIAL"),
+        )
+        .unwrap();
 
-        let plugin = unsafe { archive_webrtc_new(plugin_url.as_ptr()) };
+        let plugin = unsafe {
+            archive_webrtc_new_with_turn(
+                plugin_url.as_ptr(),
+                turn_username.as_ptr(),
+                turn_credential.as_ptr(),
+            )
+        };
         assert!(!plugin.is_null());
         thread::sleep(Duration::from_millis(750));
-        let phone = unsafe { archive_webrtc_new(phone_url.as_ptr()) };
+        let phone = unsafe {
+            archive_webrtc_new_with_turn(
+                phone_url.as_ptr(),
+                turn_username.as_ptr(),
+                turn_credential.as_ptr(),
+            )
+        };
         assert!(!phone.is_null());
 
         wait_until(Duration::from_secs(20), || unsafe {

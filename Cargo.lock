@@ -290,10 +290,10 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "au-tx"
 version = "0.2.0"
 dependencies = [
- "archive-webrtc",
  "ctrlc",
  "frame-header",
  "gen-id",
+ "libc",
  "rtrb",
  "tracing",
 ]
@@ -759,7 +759,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1301,7 +1301,7 @@ dependencies = [
 [[package]]
 name = "matchbox_protocol"
 version = "0.13.0"
-source = "git+https://github.com/wavey-ai/matchbox?rev=fdc13910db5bea6e679b5336df2ac077c89883c7#fdc13910db5bea6e679b5336df2ac077c89883c7"
+source = "git+https://github.com/wavey-ai/matchbox?rev=053f19b58de8049f5e9462d6d3b00014e2bf1519#053f19b58de8049f5e9462d6d3b00014e2bf1519"
 dependencies = [
  "cfg-if",
  "derive_more",
@@ -1312,7 +1312,7 @@ dependencies = [
 [[package]]
 name = "matchbox_socket"
 version = "0.13.0"
-source = "git+https://github.com/wavey-ai/matchbox?rev=fdc13910db5bea6e679b5336df2ac077c89883c7#fdc13910db5bea6e679b5336df2ac077c89883c7"
+source = "git+https://github.com/wavey-ai/matchbox?rev=053f19b58de8049f5e9462d6d3b00014e2bf1519#053f19b58de8049f5e9462d6d3b00014e2bf1519"
 dependencies = [
  "async-compat",
  "async-trait",
@@ -1894,7 +1894,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

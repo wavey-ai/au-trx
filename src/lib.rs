@@ -4,6 +4,7 @@ use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_void, CStr};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -11,8 +12,6 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-pub use archive_webrtc::*;
 
 const BITS_PER_SAMPLE: u8 = 24;
 const RECONNECT_INTERVAL: Duration = Duration::from_millis(50);
@@ -26,6 +25,8 @@ const DEFAULT_MAX_FRAMES: usize = 4095;
 const MAX_HEADER_BYTES: usize = 20;
 const SAMPLE_CLOCK_BYTES: usize = 12;
 const MAX_METADATA_FIELD_BYTES: usize = 512;
+const REMOTE_ARCHIVE_START: u8 = b'R';
+const REMOTE_ARCHIVE_STOP: u8 = b'L';
 const ARCHIVE_CHUNK_MAGIC: &[u8; 4] = b"IAR1";
 const ARCHIVE_CHUNK_VERSION: u16 = 1;
 const ARCHIVE_CHUNK_HEADER_BYTES: u16 = 52;
@@ -609,12 +610,14 @@ impl AudioProcessor {
         let metadata = Arc::new(RwLock::new(TrackMetadata::default()));
         let metadata_version = Arc::new(AtomicU64::new(0));
         let archive = Arc::new(ArchiveControl::default());
+        let remote_archive_capture = Arc::new(AtomicBool::new(false));
 
         let worker_shutdown = Arc::clone(&shutdown);
         let worker_status = Arc::clone(&status);
         let worker_metadata = Arc::clone(&metadata);
         let worker_metadata_version = Arc::clone(&metadata_version);
         let worker_archive = Arc::clone(&archive);
+        let worker_remote_archive_capture = Arc::clone(&remote_archive_capture);
         let worker_socket_path = socket_path.clone();
         let tx_thread = thread::Builder::new()
             .name("infidelity-au-tx".to_owned())
@@ -630,6 +633,7 @@ impl AudioProcessor {
                     worker_metadata,
                     worker_metadata_version,
                     worker_archive,
+                    worker_remote_archive_capture,
                     data_consumer,
                     free_producer,
                 );
@@ -671,7 +675,15 @@ impl AudioProcessor {
         metadata: Arc<RwLock<TrackMetadata>>,
         metadata_version: Arc<AtomicU64>,
         archive_writer: &mut ArchiveSpoolWriter,
+        remote_archive_capture: Arc<AtomicBool>,
     ) -> Result<(), std::io::Error> {
+        struct CaptureReset(Arc<AtomicBool>);
+        impl Drop for CaptureReset {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
         stream.write_all(b"AUD2")?;
 
         let mut id_buf = [0u8; 2];
@@ -684,6 +696,8 @@ impl AudioProcessor {
         } as u64;
 
         let stream_id = id as u16;
+        let mut control_stream = stream.try_clone()?;
+        let _capture_reset = CaptureReset(Arc::clone(&remote_archive_capture));
         let mut sent_metadata_version = metadata_version.load(Ordering::Acquire);
         let mut last_metadata_attempt = Instant::now();
         if let Ok(snapshot) = metadata.read().map(|metadata| metadata.clone()) {
@@ -701,8 +715,14 @@ impl AudioProcessor {
 
         // Reconnection is a live-edge operation. Never replay the AU backlog
         // accumulated while Nexus was unavailable; retain only the newest frame.
-        if let Some(frame) = Self::take_live_edge(consumer, free_producer, &status, archive_writer)
-        {
+        Self::receive_archive_control(&mut control_stream, &remote_archive_capture)?;
+        if let Some(frame) = Self::take_live_edge(
+            consumer,
+            free_producer,
+            &status,
+            archive_writer,
+            remote_archive_capture.load(Ordering::Acquire),
+        ) {
             Self::send_frame(
                 &mut stream,
                 frame,
@@ -721,6 +741,8 @@ impl AudioProcessor {
                 return Ok(());
             }
 
+            Self::receive_archive_control(&mut control_stream, &remote_archive_capture)?;
+
             let current_metadata_version = metadata_version.load(Ordering::Acquire);
             if current_metadata_version != sent_metadata_version
                 || last_metadata_attempt.elapsed() >= METADATA_HEARTBEAT_INTERVAL
@@ -735,9 +757,13 @@ impl AudioProcessor {
                 }
             }
 
-            let sent_audio = if let Some(frame) =
-                Self::take_live_edge(consumer, free_producer, &status, archive_writer)
-            {
+            let sent_audio = if let Some(frame) = Self::take_live_edge(
+                consumer,
+                free_producer,
+                &status,
+                archive_writer,
+                remote_archive_capture.load(Ordering::Acquire),
+            ) {
                 Self::send_frame(
                     &mut stream,
                     frame,
@@ -779,12 +805,17 @@ impl AudioProcessor {
         free_producer: &mut Producer<Vec<u8>>,
         status: &AudioProcessorStatusCounters,
         archive_writer: &mut ArchiveSpoolWriter,
+        preserve_all_frames: bool,
     ) -> Option<QueuedFrame> {
         let Some(mut newest) = consumer.pop().ok() else {
             archive_writer.finish_capture_if_stopped();
             return None;
         };
         archive_writer.push(&newest);
+        if preserve_all_frames {
+            archive_writer.finish_capture_if_stopped();
+            return Some(newest);
+        }
         while let Ok(frame) = consumer.pop() {
             archive_writer.push(&frame);
             let stale = std::mem::replace(&mut newest, frame);
@@ -793,6 +824,55 @@ impl AudioProcessor {
         }
         archive_writer.finish_capture_if_stopped();
         Some(newest)
+    }
+
+    fn receive_archive_control(
+        stream: &mut UnixStream,
+        remote_archive_capture: &AtomicBool,
+    ) -> Result<(), std::io::Error> {
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if ready == 0 {
+            return Ok(());
+        }
+        if descriptor.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "macOS archive control socket closed",
+            ));
+        }
+        if descriptor.revents & libc::POLLIN == 0 {
+            return Ok(());
+        }
+
+        let mut commands = [0u8; 32];
+        let count = stream.read(&mut commands)?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "macOS archive control socket closed",
+            ));
+        }
+        for command in &commands[..count] {
+            match *command {
+                REMOTE_ARCHIVE_START => remote_archive_capture.store(true, Ordering::Release),
+                REMOTE_ARCHIVE_STOP => remote_archive_capture.store(false, Ordering::Release),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid macOS archive control command",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1038,6 +1118,7 @@ impl AudioProcessor {
         metadata: Arc<RwLock<TrackMetadata>>,
         metadata_version: Arc<AtomicU64>,
         archive: Arc<ArchiveControl>,
+        remote_archive_capture: Arc<AtomicBool>,
         mut data_consumer: Consumer<QueuedFrame>,
         mut free_producer: Producer<Vec<u8>>,
     ) {
@@ -1061,6 +1142,7 @@ impl AudioProcessor {
                         Arc::clone(&metadata),
                         Arc::clone(&metadata_version),
                         &mut archive_writer,
+                        Arc::clone(&remote_archive_capture),
                     )
                     .is_err()
                     {
@@ -1922,6 +2004,7 @@ mod tests {
             &mut free_producer,
             &status,
             &mut archive_writer,
+            false,
         )
         .expect("newest frame");
 
@@ -1938,6 +2021,46 @@ mod tests {
             vec![2; 12]
         );
         assert!(consumer.pop().is_err());
+    }
+
+    #[test]
+    fn socket_worker_preserves_queued_frames_during_remote_archive_capture() {
+        let (mut producer, mut consumer) = RingBuffer::<QueuedFrame>::new(RING_SIZE);
+        let (mut free_producer, mut free_consumer) = RingBuffer::<Vec<u8>>::new(RING_SIZE);
+        let status = AudioProcessorStatusCounters::default();
+        let mut archive_writer =
+            ArchiveSpoolWriter::new(Arc::new(ArchiveControl::default()), 2, 48_000);
+
+        for sample_position in [240, 480, 720] {
+            producer
+                .push(QueuedFrame {
+                    sample_position,
+                    transport_generation: 3,
+                    archive_capture: false,
+                    data: vec![(sample_position / 240) as u8; 12],
+                })
+                .expect("test queue has capacity");
+        }
+
+        let first = AudioProcessor::take_live_edge(
+            &mut consumer,
+            &mut free_producer,
+            &status,
+            &mut archive_writer,
+            true,
+        )
+        .expect("oldest frame");
+
+        assert_eq!(first.sample_position, 240);
+        assert_eq!(status.frames_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            consumer
+                .pop()
+                .expect("second frame remains queued")
+                .sample_position,
+            480
+        );
+        assert!(free_consumer.pop().is_err());
     }
 
     #[test]
